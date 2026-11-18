@@ -57,6 +57,8 @@ EVENT_CTA_STOPORDER: str = "eCtaStopOrder"
 INTERVAL_DELTA_MAP: dict[Interval, timedelta] = {
     Interval.TICK: timedelta(milliseconds=1),
     Interval.MINUTE: timedelta(minutes=1),
+    Interval.MINUTE5: timedelta(minutes=5),
+    Interval.MINUTE15: timedelta(minutes=15),
     Interval.HOUR: timedelta(hours=1),
     Interval.DAILY: timedelta(days=1),
 }

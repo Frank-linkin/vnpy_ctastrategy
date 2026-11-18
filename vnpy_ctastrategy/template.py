@@ -15,6 +15,7 @@ class CtaTemplate(ABC):
     """CTA策略模板。"""
 
     author: str = ""
+    backtest_from_5m: bool = False
     parameters: list = []
     variables: list = []
 

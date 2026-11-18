@@ -7,7 +7,7 @@ import numpy as np
 import talib
 from talib import abstract
 
-from vnpy.trader.constant import Direction, Offset, OrderType
+from vnpy.trader.constant import Direction, Interval, Offset, OrderType
 from vnpy_ctastrategy import (
     ArrayManager, BarData, BarGenerator, CtaTemplate, OrderData,
     StopOrder, TickData, TradeData,
@@ -19,6 +19,7 @@ class JapanPatternWithMaStrategy(CtaTemplate):
     """用 RSI 筛选蜡烛图信号，按持仓时间和均线穿越管理单手仓位。"""
 
     author = "Codex"
+    backtest_from_5m = True
     m: int = 14
     sma_window: int = 10
     rsi_low: float = 30
@@ -63,7 +64,13 @@ class JapanPatternWithMaStrategy(CtaTemplate):
             self.sup_create_backtest_log()
         self.write_log(f"初始化：m={self.m}，RSI阈值={self.rsi_low}/{self.rsi_high}，"
                        f"SMA={self.sma_window}，全部形态数={len(self.patterns)}，预热={size}根")
-        self.load_bar(10)
+        warmup_interval = Interval.MINUTE
+        if (
+            self.get_engine_type() == EngineType.BACKTESTING
+            and self.cta_engine.interval in (Interval.MINUTE15, Interval.HOUR)
+        ):
+            warmup_interval = self.cta_engine.interval
+        self.load_bar(10, interval=warmup_interval)
 
     def sup_create_backtest_log(self) -> None:
         """用本次回测开始的本地时间创建日志文件，同一分钟重复运行时避免覆盖。"""
@@ -149,12 +156,15 @@ class JapanPatternWithMaStrategy(CtaTemplate):
         bearish: list[str] = []
         inputs = {"open": self.am.open, "high": self.am.high,
                   "low": self.am.low, "close": self.am.close}
+        # 判断属于哪种Candlestick Pattern
         for name, function in self.patterns.items():
             value = function(inputs)[-1]
             if value > 0:
                 bullish.append(name)
             elif value < 0:
                 bearish.append(name)
+
+        # 对上一根空头信号进行确认
         short_signal = False
         confirmed_patterns = self.pending_short_patterns.copy()
         self.signal_patterns = []
@@ -162,8 +172,10 @@ class JapanPatternWithMaStrategy(CtaTemplate):
             short_signal = bar.close_price < self.pending_short_close
             self.write_log(f"bar_time={bar.datetime} 空头次根确认：前收={self.pending_short_close} "
                            f"现收={bar.close_price}，结果={short_signal}")
+        # 将上一个k线的空头信号清掉
         self.pending_short_close = None
         self.pending_short_patterns = []
+        # 本根k线至少出现一个看涨形态，且RSI<= rsi_low, 则设置多头信号
         long_signal = bool(bullish) and self.rsi_value <= self.rsi_low
         if bearish and self.rsi_value >= self.rsi_high:
             self.pending_short_close = bar.close_price
@@ -174,6 +186,9 @@ class JapanPatternWithMaStrategy(CtaTemplate):
         if long_signal and short_signal:
             self.write_log(f"bar_time={bar.datetime} 多空开仓信号冲突，跳过本次入场")
             return 0
+        # 多头信号，本根看涨，返回1
+        # 空头信号，本根确认看空，返回-1
+        # 无信号，返回 0
         self.signal_patterns = bullish.copy() if long_signal else confirmed_patterns if short_signal else []
         return 1 if long_signal else -1 if short_signal else 0
 

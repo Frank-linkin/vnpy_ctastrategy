@@ -45,6 +45,51 @@ from .template import CtaTemplate
 from .locale import _
 
 
+def aggregate_5m_bars(
+    bars: list[BarData], interval: Interval, end: datetime
+) -> list[BarData]:
+    """合成整钟对齐且连续完整的目标周期K线。"""
+    source_step = INTERVAL_DELTA_MAP[Interval.MINUTE5]
+    window = INTERVAL_DELTA_MAP[interval]
+    window_minutes = window // timedelta(minutes=1)
+    expected_count = window // source_step
+    windows: dict[datetime, list[BarData]] = defaultdict(list)
+
+    for bar in bars:
+        dt = bar.datetime
+        start = dt.replace(
+            minute=dt.minute // window_minutes * window_minutes,
+            second=0,
+            microsecond=0,
+        )
+        windows[start].append(bar)
+
+    result: list[BarData] = []
+    for start, group in windows.items():
+        boundary = end.replace(tzinfo=start.tzinfo) if end.tzinfo is None else end
+        if start + window > boundary or len(group) != expected_count:
+            continue
+        if any(bar.datetime != start + index * source_step for index, bar in enumerate(group)):
+            continue
+
+        first, last = group[0], group[-1]
+        result.append(BarData(
+            symbol=first.symbol,
+            exchange=first.exchange,
+            datetime=start,
+            interval=interval,
+            open_price=first.open_price,
+            high_price=max(bar.high_price for bar in group),
+            low_price=min(bar.low_price for bar in group),
+            close_price=last.close_price,
+            volume=sum(bar.volume for bar in group),
+            turnover=sum(bar.turnover for bar in group),
+            open_interest=last.open_interest,
+            gateway_name=first.gateway_name,
+        ))
+    return result
+
+
 class BacktestingEngine:
     """CTA策略回测引擎。"""
 
@@ -78,6 +123,7 @@ class BacktestingEngine:
         self.days: int = 0
         self.callback: Callable
         self.history_data: list = []
+        self.using_5m_source: bool = False
 
         self.stop_order_count: int = 0
         self.stop_orders: dict[str, StopOrder] = {}
@@ -173,12 +219,19 @@ class BacktestingEngine:
             return
 
         self.history_data.clear()       # Clear previously loaded history data
+        self.using_5m_source = False
 
         # Load 30 days of data each time and allow for progress update
         total_days: int = (self.end - self.start).days
         progress_days: int = max(int(total_days / 10), 1)
         progress_delta: timedelta = timedelta(days=progress_days)
-        interval_delta: timedelta = INTERVAL_DELTA_MAP[self.interval]
+        aggregate = (
+            self.mode == BacktestingMode.BAR
+            and self.interval in (Interval.MINUTE15, Interval.HOUR)
+            and getattr(getattr(self, "strategy", None), "backtest_from_5m", False)
+        )
+        source_interval = Interval.MINUTE5 if aggregate else self.interval
+        interval_delta: timedelta = INTERVAL_DELTA_MAP[source_interval]
 
         start: datetime = self.start
         end: datetime = self.start + progress_delta
@@ -191,12 +244,14 @@ class BacktestingEngine:
             end = min(end, self.end)  # Make sure end time stays within set range
 
             if self.mode == BacktestingMode.BAR:
+                # 数据库查询包含两端，合成时用半开分段避免边界数据重复。
+                query_end = end - timedelta(microseconds=1) if aggregate and end < self.end else end
                 data: list[BarData] | list[TickData] = load_bar_data(
                     self.symbol,
                     self.exchange,
-                    self.interval,
+                    source_interval,
                     start,
-                    end
+                    query_end
                 )
             else:
                 data = load_tick_data(
@@ -208,11 +263,23 @@ class BacktestingEngine:
 
             self.history_data.extend(data)
 
-            progress += progress_days / total_days
+            progress += progress_days / max(total_days, 1)
             progress = min(progress, 1)
 
-            start = end + interval_delta
+            start = end if aggregate else end + interval_delta
             end += progress_delta
+
+        if aggregate and self.history_data:
+            self.using_5m_source = True
+            self.history_data[:] = aggregate_5m_bars(
+                self.history_data, self.interval, self.end + timedelta(seconds=1)
+            )
+            self.output(f"从 5m 数据合成 {self.interval.value} K线：{len(self.history_data)} 根")
+        elif aggregate:
+            self.output(f"回测区间无 5m 数据，尝试加载原生 {self.interval.value} K线")
+            self.history_data.extend(load_bar_data(
+                self.symbol, self.exchange, self.interval, self.start, self.end
+            ))
 
         self.output(_("历史数据加载完成，数据量：{}").format(len(self.history_data)))
 
@@ -858,6 +925,13 @@ class BacktestingEngine:
     ) -> list[BarData]:
         """加载回测开始前的历史K线，并保存回调。"""
         self.callback = callback
+
+        if self.using_5m_source and interval == self.interval:
+            symbol, exchange = extract_vt_symbol(vt_symbol)
+            source_bars = load_bar_data(
+                symbol, exchange, Interval.MINUTE5, self.start - timedelta(days=days), self.start
+            )
+            return aggregate_5m_bars(source_bars, self.interval, self.start)
 
         init_end: datetime = self.start - INTERVAL_DELTA_MAP[interval]
         init_start: datetime = self.start - timedelta(days=days)
